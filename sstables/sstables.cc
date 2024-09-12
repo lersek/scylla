@@ -1559,6 +1559,23 @@ future<> sstable::reload_reclaimed_components() {
     sstlog.info("Reloaded bloom filter of {}", get_filename());
 }
 
+future<uint64_t> sstable::bytes_on_disk_uncached() const noexcept {
+    uint64_t bytes = 0;
+
+    co_await coroutine::parallel_for_each(_recognized_components, [this, &bytes] (const component_type& type) -> future<> {
+        try {
+            file f = co_await _storage->open_component(*this, type, open_flags::ro, file_open_options{}, false);
+            struct stat st = co_await with_closeable(std::move(f), [] (file& f) {
+                return f.stat();
+            });
+            bytes += st.st_size;
+        } catch (...) {
+            sstlog.warn("failed to get size of {} for disk usage metric: {}", filename(type), std::current_exception());
+        }
+    });
+    co_return bytes;
+}
+
 future<> sstable::load_metadata(sstable_open_config cfg, bool validate) noexcept {
     co_await read_toc();
     // read scylla-meta after toc. Might need it to parse
@@ -1588,6 +1605,7 @@ future<> sstable::load(const dht::sharder& sharder, sstable_open_config cfg) noe
                 std::vector<unsigned>{this_shard_id()} : compute_shards_for_this_sstable(sharder);
     }
     co_await open_data(cfg);
+    _stats.on_seal_or_load(co_await bytes_on_disk_uncached());
 }
 
 future<> sstable::load(sstables::foreign_sstable_open_info info) noexcept {
@@ -1602,6 +1620,7 @@ future<> sstable::load(sstables::foreign_sstable_open_info info) noexcept {
     validate_max_local_deletion_time();
     validate_partitioner();
     co_await update_info_for_opened_data();
+    _stats.on_seal_or_load(co_await bytes_on_disk_uncached());
     _total_reclaimable_memory.reset();
     _manager.increment_total_reclaimable_memory_and_maybe_reclaim(this);
 }
@@ -1902,6 +1921,7 @@ bool sstable::may_contain_rows(const query::clustering_row_ranges& ranges) const
 future<> sstable::seal_sstable(bool backup)
 {
     co_await _storage->seal(*this);
+    _stats.on_seal_or_load(co_await bytes_on_disk_uncached());
     if (_marked_for_deletion == mark_for_deletion::implicit) {
         _marked_for_deletion = mark_for_deletion::none;
     }
@@ -3053,6 +3073,7 @@ future<>
 sstable::unlink(storage::sync_dir sync) noexcept {
     _on_delete(*this);
 
+    uint64_t bytes = co_await bytes_on_disk_uncached();
     auto remove_fut = _storage->wipe(*this, sync);
 
     try {
@@ -3065,7 +3086,7 @@ sstable::unlink(storage::sync_dir sync) noexcept {
     }
 
     co_await std::move(remove_fut);
-    _stats.on_delete();
+    _stats.on_delete(bytes);
     _manager.on_unlink(this);
 }
 
@@ -3188,6 +3209,9 @@ future<> init_metrics() {
 
         sm::make_counter("total_deleted", [] { return sstables_stats::get_shard_stats().deleted; },
             sm::description("Counter of deleted sstables")),
+
+        sm::make_gauge("bytes_on_disk", [] { return sstables_stats::get_shard_stats().bytes_on_disk; },
+            sm::description("Bytes currently used on disk by sstables")),
 
         sm::make_gauge("bloom_filter_memory_size", [] { return utils::filter::bloom_filter::get_shard_stats().memory_size; },
             sm::description("Bloom filter memory usage in bytes.")),
